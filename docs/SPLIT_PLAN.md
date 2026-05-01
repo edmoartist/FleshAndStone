@@ -2,36 +2,55 @@
 
 ## Goal
 
-Move the project away from one giant HTML file without breaking the known-good playable build.
+Move the project away from one giant HTML file without losing a playable fallback.
 
 ## Current state
 
-The repository started with one playable file:
+The original playable build remains untouched:
 
 ```text
 toybox_catacombs_single_file_html_53.html
 ```
 
-That file is intentionally left untouched in this PR.
-
-## Stage 1: Safe wrapper
-
-Added:
+The modular entrypoint now uses:
 
 ```text
 index.html
 styles/main.css
-README.md
-scripts/split_single_file_html.py
+src/game-loader.js
 ```
 
-`index.html` launches the original game file through an iframe. This gives the repo a normal browser entrypoint while keeping the old build intact.
+`src/game-loader.js` fetches the original single-file HTML, extracts its inline CSS and JavaScript, injects the CSS into the page, and then runs the extracted JavaScript against the normal `#game` canvas in `index.html`.
 
-## Stage 2: Mechanical extraction
+This is an intermediate split. It proves the repo can use external files without immediately hand-editing the entire 62 KB game script through the GitHub bridge.
+
+## Running locally
+
+Directly opening `index.html` from disk may fail because browsers usually block `fetch()` from `file://`.
+
+Use:
+
+```bash
+python scripts/dev_server.py
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8000/index.html
+```
+
+The original single-file build can still be opened directly at any time:
+
+```text
+toybox_catacombs_single_file_html_53.html
+```
+
+## Next split stage
 
 Run:
 
-```powershell
+```bash
 python scripts/split_single_file_html.py
 ```
 
@@ -43,20 +62,29 @@ styles/extracted.css
 src/game.js
 ```
 
-This stage should be verified manually before replacing the root `index.html`.
+After manual browser testing, promote those generated files:
 
-## Stage 3: Real module split
+```text
+index.split.html      -> index.html
+styles/extracted.css  -> styles/main.css
+src/game.js           -> src/game.js
+```
 
-Once `src/game.js` is confirmed to behave exactly like the original script, split it by responsibility:
+Then delete `src/game-loader.js`.
+
+## Final module split
+
+Once `src/game.js` is the live source, split by responsibility:
 
 ```text
 src/core/random.js
 src/core/input.js
+src/core/math.js
 src/game/state.js
 src/game/items.js
 src/game/player.js
 src/game/enemies.js
-src/game/level_generation.js
+src/game/level-generation.js
 src/game/combat.js
 src/game/rendering.js
 src/main.js
@@ -64,4 +92,4 @@ src/main.js
 
 ## Rule
 
-Do not delete the original single-file HTML until the split build has been manually tested in browser.
+Keep the original single-file HTML until the fully split build has been manually tested in browser.
