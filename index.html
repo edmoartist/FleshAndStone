@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flesh And Stone</title>
+  <link rel="stylesheet" href="styles/main.css" />
+  <style id="legacy-style"></style>
+</head>
+<body>
+  <canvas id="game" width="1280" height="720"></canvas>
+
+  <div id="boot-error" hidden>
+    <h1>Flesh And Stone</h1>
+    <p>
+      The modular loader could not fetch the original single-file build.
+      This usually happens when opening <code>index.html</code> directly from disk.
+    </p>
+    <p>
+      Run a tiny local server instead:
+    </p>
+    <pre>python scripts/dev_server.py</pre>
+    <p>
+      Fallback:
+      <a href="toybox_catacombs_single_file_html_53.html">open the original single-file build</a>.
+    </p>
+  </div>
+
+  <script src="src/game-loader.js"></script>
+</body>
+</html>
