@@ -1,0 +1,1379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Clockwork Manor - Single File HTML5 Roguelite</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #08070a;
+    color: #f4e9d8;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    overflow: hidden;
+  }
+  #game {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    image-rendering: pixelated;
+    background: #09070b;
+    cursor: crosshair;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="1280" height="720"></canvas>
+<script>
+(() => {
+'use strict';
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+const TILE = 32;
+const ROOM_W = 34;
+const ROOM_H = 20;
+const ROOM_MARGIN = 4;
+const T = { FLOOR: 0, WALL: 1, BREAK: 2, SPIKE: 3, TRAPDOOR: 4, SHOP: 5, DOOR: 6 };
+const DIRS = { N:[0,-1], E:[1,0], S:[0,1], W:[-1,0] };
+const OPP = { N:'S', S:'N', E:'W', W:'E' };
+const TAU = Math.PI * 2;
+
+function fitCanvas() {
+  const dpr = Math.max(1, Math.min(2, devicePixelRatio || 1));
+  canvas.width = Math.floor(innerWidth * dpr);
+  canvas.height = Math.floor(innerHeight * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+}
+addEventListener('resize', fitCanvas);
+fitCanvas();
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function dist(a, b, c, d) { return Math.hypot(a - c, b - d); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function normAng(a) { while (a < -Math.PI) a += TAU; while (a > Math.PI) a -= TAU; return a; }
+function keyOf(x, y) { return x + ',' + y; }
+function wrapText(text, max) {
+  const words = text.split(' '), lines = [];
+  let line = '';
+  for (const w of words) {
+    if ((line + w).length > max) { lines.push(line.trim()); line = ''; }
+    line += w + ' ';
+  }
+  if (line.trim()) lines.push(line.trim());
+  return lines;
+}
+
+function hashSeed(str) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function mulberry32(a) {
+  return function() {
+    let t = a += 0x6D2B79F5;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+let rng = mulberry32(Date.now());
+function rnd() { return rng(); }
+function ri(a, b) { return Math.floor(rnd() * (b - a + 1)) + a; }
+function chance(p) { return rnd() < p; }
+function pick(arr) { return arr[Math.floor(rnd() * arr.length)]; }
+function shuffle(arr) { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; }
+
+const keys = Object.create(null);
+let justInteract = false;
+addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;
+  if (e.key.toLowerCase() === 'e') justInteract = true;
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+  if (e.key.toLowerCase() === 'r' && (G.state === 'dead' || G.state === 'win' || G.state === 'title')) startRun();
+  if (e.key === 'Enter' && G.state === 'title') startRun();
+});
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+const mouse = { x: 0, y: 0, down: false };
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = e.clientX - r.left;
+  mouse.y = e.clientY - r.top;
+});
+canvas.addEventListener('mousedown', () => {
+  mouse.down = true;
+  if (G.state === 'title') startRun();
+});
+canvas.addEventListener('mouseup', () => mouse.down = false);
+
+const ITEMS = [
+  { name:'Pepper Lens', tag:'piercing heat', desc:'+Damage. Shots pierce once. Piercing + poison is brutal.', apply:p=>{p.damage+=1.3;p.pierce+=1;} },
+  { name:'Glass Drizzle', tag:'wide rain', desc:'+2 shots per volley, lower damage. Great with lightning or poison.', apply:p=>{p.shots+=2;p.spread+=0.17;p.damage*=0.82;} },
+  { name:'Static Jam', tag:'chain zap', desc:'Hits arc lightning to nearby enemies. Multishot makes storms.', apply:p=>{p.lightning=true;p.damage+=0.35;} },
+  { name:'Toxic Glue', tag:'floor venom', desc:'Shots poison and leave puddles on split or death.', apply:p=>{p.poison=true;p.damage+=0.25;} },
+  { name:'Forked Candle', tag:'split shots', desc:'Shots split into two smaller shots. Combines with poison and lightning.', apply:p=>{p.split=true;p.fireRate*=0.93;} },
+  { name:'Boomerang Thread', tag:'rebounds', desc:'Shots bounce from walls. Homing bounce shots hunt around furniture.', apply:p=>{p.bounce+=2;p.range+=320;} },
+  { name:'Tiny Moon', tag:'soft homing', desc:'Shots bend toward targets. Also pulls coins from farther away.', apply:p=>{p.homing=true;p.magnet+=0.4;} },
+  { name:'Clockwork Spoon', tag:'faster hands', desc:'Move and shoot faster.', apply:p=>{p.speed+=36;p.fireRate*=0.78;} },
+  { name:'Lucky Receipt', tag:'shop abuse', desc:'Cheaper shops and better drops.', apply:p=>{p.discount*=0.7;p.luck+=0.2;} },
+  { name:'Magnet Marble', tag:'loot vacuum', desc:'Coins, hearts, and secret pickups drift toward you.', apply:p=>{p.magnet+=1.1;} },
+  { name:'Pocket Saw', tag:'orbital blade', desc:'Adds an orbiting saw that shreds nearby enemies and furniture.', apply:p=>{p.orbitals+=1;} },
+  { name:'Secret Chalk', tag:'wall whispers', desc:'Secret walls shimmer. Breakable walls crack faster.', apply:p=>{p.secretSense=true;p.breakBonus+=1.2;} },
+  { name:'Vampire Button', tag:'red reward', desc:'Occasionally heals when enemies die.', apply:p=>{p.vampire+=0.18;p.maxHp+=1;p.hp=Math.min(p.maxHp,p.hp+1);} },
+  { name:'Splinter Dice', tag:'messy crits', desc:'Luck-based critical hits and extra furniture drops.', apply:p=>{p.crit+=0.16;p.luck+=0.12;} },
+  { name:'Bomb Seed', tag:'popcorn blast', desc:'Some shots burst on impact. Forked bounces become chaos.', apply:p=>{p.bombShot+=0.24;} },
+  { name:'Ink Sneakers', tag:'trap dancer', desc:'Speed up and take half damage from spikes.', apply:p=>{p.speed+=54;p.spikeResist=true;} },
+  { name:'Cardboard Crown', tag:'greedy power', desc:'Every 10 coins grants damage. Discounts stack hard.', apply:p=>{p.coinPower=true;p.discount*=0.86;} },
+  { name:'Lantern Belly', tag:'more life', desc:'+2 max hearts and a warm manor glow.', apply:p=>{p.maxHp+=2;p.hp+=2;p.glow+=80;} }
+];
+
+const G = {
+  state: 'title',
+  floor: 1,
+  seedText: '',
+  level: null,
+  player: null,
+  bullets: [], ebullets: [], enemies: [], props: [], items: [], drops: [], particles: [], hazards: [], traps: [], texts: [],
+  merchant: null,
+  cam: { x: 0, y: 0 },
+  now: 0,
+  shake: 0,
+  message: '',
+  messageT: 0,
+  currentRoom: -1
+};
+
+function makePlayer(x, y) {
+  return {
+    x, y, r: 12, hp: 6, maxHp: 6, coins: 0,
+    speed: 166, damage: 3.1, shotSpeed: 470, fireRate: 260, range: 720,
+    shots: 1, spread: 0.09, pierce: 0, bounce: 0,
+    poison: false, lightning: false, split: false, homing: false,
+    magnet: 0, discount: 1, luck: 0, orbitals: 0, vampire: 0, crit: 0, bombShot: 0,
+    spikeResist: false, secretSense: false, breakBonus: 0, coinPower: false, glow: 0,
+    fireCd: 0, inv: 0, activeCd: 0, items: [], kills: 0
+  };
+}
+
+function gridArray(w, h, fill) { return Array.from({ length: h }, () => Array(w).fill(fill)); }
+function inMap(x, y) { return G.level && x >= 0 && y >= 0 && x < G.level.w && y < G.level.h; }
+function tileAt(tx, ty) { return !inMap(tx, ty) ? T.WALL : G.level.grid[ty][tx]; }
+function doorClosed(tx, ty) {
+  if (!G.level) return false;
+  const door = G.level.doorMap[keyOf(tx, ty)];
+  if (!door) return false;
+
+  // Door safety: never close a combat door while the player is standing in or beside it.
+  // This prevents the doorway trap where the player triggers the next room and gets pinned.
+  if (G.player) {
+    const cx = tx * TILE + TILE / 2;
+    const cy = ty * TILE + TILE / 2;
+    if (dist(G.player.x, G.player.y, cx, cy) < 58) return false;
+  }
+
+  for (const id of door.rooms) {
+    const r = G.level.rooms[id];
+    if (r && r.seen && !r.cleared && (r.type === 'combat' || r.type === 'boss')) return true;
+  }
+  return false;
+}
+function solidTile(tx, ty) {
+  const t = tileAt(tx, ty);
+  if (t === T.DOOR) return doorClosed(tx, ty);
+  return t === T.WALL || t === T.BREAK;
+}
+function worldTile(x, y) { return [Math.floor(x / TILE), Math.floor(y / TILE)]; }
+function roomAtWorld(x, y) {
+  const [tx, ty] = worldTile(x, y);
+  if (!inMap(tx, ty)) return -1;
+  return G.level.roomId[ty][tx];
+}
+function floorWorld(cell) { return { x: cell[0] * TILE + TILE / 2, y: cell[1] * TILE + TILE / 2 }; }
+function isFloorish(tx, ty) { const t = tileAt(tx, ty); return t === T.FLOOR || t === T.SPIKE || t === T.TRAPDOOR || t === T.SHOP || t === T.DOOR; }
+
+function solidWorld(x, y, r = 8) {
+  const pts = [[x-r,y],[x+r,y],[x,y-r],[x,y+r],[x-r*0.72,y-r*0.72],[x+r*0.72,y-r*0.72],[x-r*0.72,y+r*0.72],[x+r*0.72,y+r*0.72]];
+  for (const p of pts) {
+    const tx = Math.floor(p[0] / TILE), ty = Math.floor(p[1] / TILE);
+    if (solidTile(tx, ty)) return true;
+  }
+  for (const prop of G.props) {
+    if (!prop.solid || prop.hp <= 0) continue;
+    if (circleRect(x, y, r, prop.x - prop.w/2, prop.y - prop.h/2, prop.w, prop.h)) return true;
+  }
+  return false;
+}
+function moveCircle(o, dx, dy, r = o.r || 9) {
+  if (!solidWorld(o.x + dx, o.y, r)) o.x += dx;
+  else { o.vx = (o.vx || 0) * -0.25; }
+  if (!solidWorld(o.x, o.y + dy, r)) o.y += dy;
+  else { o.vy = (o.vy || 0) * -0.25; }
+}
+function circleRect(cx, cy, cr, rx, ry, rw, rh) {
+  const nx = clamp(cx, rx, rx + rw), ny = clamp(cy, ry, ry + rh);
+  return Math.hypot(cx - nx, cy - ny) <= cr;
+}
+
+function generateLevel(floor, seedText) {
+  rng = mulberry32(hashSeed(seedText + ':floor:' + floor));
+
+  const nodes = [];
+  const abstract = Object.create(null);
+  const links = [];
+  function absKey(x, y) { return x + ',' + y; }
+  function addNode(gx, gy, type) {
+    const id = nodes.length;
+    const node = { id, gx, gy, type, links:[], doors:{}, seen:false, cleared:false, rewarded:false, cells:[], bounds:null, center:null, theme:null, rugs:[], secretBase:false };
+    nodes.push(node);
+    abstract[absKey(gx, gy)] = node;
+    return node;
+  }
+  function getNode(gx, gy) { return abstract[absKey(gx, gy)]; }
+  function dirBetween(a, b) {
+    const dx = b.gx - a.gx, dy = b.gy - a.gy;
+    if (dx === 1) return 'E'; if (dx === -1) return 'W'; if (dy === 1) return 'S'; return 'N';
+  }
+  function connect(a, b, secret = false) {
+    if (!a || !b || a === b) return;
+    if (links.some(l => (l.a === a.id && l.b === b.id) || (l.a === b.id && l.b === a.id))) return;
+    const d = dirBetween(a, b);
+    links.push({ a:a.id, b:b.id, dir:d, secret });
+    a.links.push(b.id); b.links.push(a.id);
+    a.doors[d] = { to:b.id, secret };
+    b.doors[OPP[d]] = { to:a.id, secret };
+  }
+  function emptyAdjacent(base) {
+    const ds = shuffle(Object.keys(DIRS));
+    for (const d of ds) {
+      const v = DIRS[d];
+      const nx = base.gx + v[0], ny = base.gy + v[1];
+      if (!getNode(nx, ny)) return [nx, ny];
+    }
+    return null;
+  }
+  function addAdjacent(base, type) {
+    const pos = emptyAdjacent(base);
+    if (!pos) return null;
+    const n = addNode(pos[0], pos[1], type);
+    connect(base, n, false);
+    return n;
+  }
+
+  const start = addNode(0, 0, 'start');
+  start.seen = true; start.cleared = true;
+  let current = start;
+  const mainLen = 5 + Math.min(3, floor);
+  for (let i = 1; i <= mainLen; i++) {
+    let next = null;
+    for (let tries = 0; tries < 50 && !next; tries++) {
+      const base = tries < 18 ? current : pick(nodes.filter(n => n.type !== 'boss' && n.type !== 'secret'));
+      const type = i === mainLen ? 'boss' : 'combat';
+      next = addAdjacent(base, type);
+      if (next && base !== current && i !== mainLen && chance(0.35)) current = base;
+    }
+    if (next) current = next;
+  }
+
+  function addSpecial(type) {
+    for (let tries = 0; tries < 70; tries++) {
+      const base = pick(nodes.filter(n => !['boss','secret','treasure','merchant'].includes(n.type)));
+      const n = addAdjacent(base, type);
+      if (n) { n.cleared = true; return n; }
+    }
+    return null;
+  }
+  addSpecial('treasure');
+  if (floor > 1 || chance(0.8)) addSpecial('treasure');
+  addSpecial('merchant');
+  for (let i = 0; i < 2 + floor; i++) {
+    const base = pick(nodes.filter(n => n.type !== 'boss' && n.type !== 'secret'));
+    let last = base;
+    const len = ri(1, 2);
+    for (let j = 0; j < len; j++) {
+      const n = addAdjacent(last, 'combat');
+      if (!n) break;
+      last = n;
+    }
+  }
+
+  let secret = null;
+  for (let tries = 0; tries < 100 && !secret; tries++) {
+    const base = pick(nodes.filter(n => !['boss','secret','merchant'].includes(n.type)));
+    const pos = emptyAdjacent(base);
+    if (!pos) continue;
+    secret = addNode(pos[0], pos[1], 'secret');
+    secret.cleared = true;
+    secret.secretBase = base.id;
+    connect(base, secret, true);
+  }
+
+  const minGX = Math.min(...nodes.map(n => n.gx));
+  const maxGX = Math.max(...nodes.map(n => n.gx));
+  const minGY = Math.min(...nodes.map(n => n.gy));
+  const maxGY = Math.max(...nodes.map(n => n.gy));
+  const w = (maxGX - minGX + 1) * ROOM_W + ROOM_MARGIN * 2;
+  const h = (maxGY - minGY + 1) * ROOM_H + ROOM_MARGIN * 2;
+  const grid = gridArray(w, h, T.WALL);
+  const deco = gridArray(w, h, 0).map(row => row.map(() => ri(0, 7)));
+  const roomId = gridArray(w, h, -1);
+  const breakHp = Object.create(null);
+  const secretTiles = Object.create(null);
+  const doorMap = Object.create(null);
+  const doors = [];
+
+  function carveCell(x, y, id, tile = T.FLOOR) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    grid[y][x] = tile;
+    roomId[y][x] = id;
+    const r = nodes[id];
+    r.cells.push([x, y]);
+  }
+  function wallCell(x, y, id) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    grid[y][x] = T.WALL;
+    roomId[y][x] = id;
+  }
+  function breakCell(x, y, id, hp = 7, secretDoor = false, pair = null) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    grid[y][x] = T.BREAK;
+    roomId[y][x] = id;
+    breakHp[keyOf(x, y)] = hp;
+    if (secretDoor) secretTiles[keyOf(x, y)] = { pair };
+  }
+
+  function rectTiles(r, x, y, rw, rh, tile = null) {
+    const x0 = clamp(Math.floor(x), r.bounds.x0 + 1, r.bounds.x1 - 1);
+    const y0 = clamp(Math.floor(y), r.bounds.y0 + 1, r.bounds.y1 - 1);
+    const x1 = clamp(Math.floor(x + rw), r.bounds.x0 + 1, r.bounds.x1);
+    const y1 = clamp(Math.floor(y + rh), r.bounds.y0 + 1, r.bounds.y1);
+    for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) carveCell(xx, yy, r.id, tile || (r.type === 'merchant' ? T.SHOP : T.FLOOR));
+  }
+  function addZone(r, type, x, y, rw, rh) {
+    const z = {
+      type,
+      x: clamp(Math.floor(x), r.bounds.x0 + 1, r.bounds.x1 - 4),
+      y: clamp(Math.floor(y), r.bounds.y0 + 1, r.bounds.y1 - 4),
+      w: Math.max(4, Math.floor(rw)),
+      h: Math.max(4, Math.floor(rh))
+    };
+    z.x = clamp(z.x, r.bounds.x0 + 1, r.bounds.x1 - z.w);
+    z.y = clamp(z.y, r.bounds.y0 + 1, r.bounds.y1 - z.h);
+    z.cx = z.x + z.w / 2;
+    z.cy = z.y + z.h / 2;
+    r.zones.push(z);
+    rectTiles(r, z.x, z.y, z.w, z.h);
+    return z;
+  }
+  function carveCorridorInRoom(r, a, b, width = 3, tile = null) {
+    let x = Math.round(a.cx), y = Math.round(a.cy);
+    const tx = Math.round(b.cx), ty = Math.round(b.cy);
+    const firstHorizontal = chance(0.5);
+    function stamp(cx, cy) {
+      for (let yy = -Math.floor(width/2); yy <= Math.floor(width/2); yy++) {
+        for (let xx = -Math.floor(width/2); xx <= Math.floor(width/2); xx++) {
+          const px = cx + xx, py = cy + yy;
+          if (px > r.bounds.x0 && px < r.bounds.x1 && py > r.bounds.y0 && py < r.bounds.y1) carveCell(px, py, r.id, tile || (r.type === 'merchant' ? T.SHOP : T.FLOOR));
+        }
+      }
+    }
+    const walkX = () => { while (x !== tx) { x += Math.sign(tx - x); stamp(x, y); if (chance(0.08) && y !== ty) { y += Math.sign(ty - y); stamp(x, y); } } };
+    const walkY = () => { while (y !== ty) { y += Math.sign(ty - y); stamp(x, y); if (chance(0.08) && x !== tx) { x += Math.sign(tx - x); stamp(x, y); } } };
+    stamp(x, y);
+    if (firstHorizontal) { walkX(); walkY(); } else { walkY(); walkX(); }
+  }
+  function planRoom(r) {
+    const b = r.bounds;
+    r.zones = [];
+
+    const mainW = r.type === 'boss' ? 16 : r.type === 'merchant' ? 14 : ri(10, 14);
+    const mainH = r.type === 'boss' ? 10 : r.type === 'merchant' ? 8 : ri(7, 10);
+    const main = addZone(r, r.type === 'boss' ? 'arena' : 'main', Math.floor(r.center.x - mainW/2), Math.floor(r.center.y - mainH/2), mainW, mainH);
+
+    const entryByDir = {};
+    for (const d of Object.keys(r.doors)) {
+      let z;
+      if (d === 'N') z = addZone(r, 'entry', Math.floor(r.center.x - 4), b.y0 + 1, 8, 5);
+      if (d === 'S') z = addZone(r, 'entry', Math.floor(r.center.x - 4), b.y1 - 5, 8, 4);
+      if (d === 'W') z = addZone(r, 'entry', b.x0 + 1, Math.floor(r.center.y - 3), 6, 6);
+      if (d === 'E') z = addZone(r, 'entry', b.x1 - 6, Math.floor(r.center.y - 3), 5, 6);
+      if (z) { entryByDir[d] = z; carveCorridorInRoom(r, z, main, 3); }
+    }
+
+    const sideCount = r.type === 'boss' ? 4 : r.type === 'start' ? 3 : r.type === 'merchant' ? 5 : r.type === 'treasure' || r.type === 'secret' ? 2 : ri(3, 5);
+    const anchors = shuffle([
+      [b.x0 + 2, b.y0 + 2],
+      [b.x1 - 10, b.y0 + 2],
+      [b.x0 + 2, b.y1 - 7],
+      [b.x1 - 10, b.y1 - 7],
+      [Math.floor(r.center.x - 5), b.y0 + 2],
+      [Math.floor(r.center.x - 5), b.y1 - 7],
+      [b.x0 + 2, Math.floor(r.center.y - 3)],
+      [b.x1 - 10, Math.floor(r.center.y - 3)]
+    ]);
+    for (let i = 0; i < sideCount; i++) {
+      const a = anchors[i % anchors.length];
+      const zw = ri(6, r.type === 'boss' ? 9 : 11);
+      const zh = ri(4, 7);
+      const z = addZone(r, i === 0 && r.type === 'combat' && chance(0.45) ? 'trap_nook' : 'side', a[0] + ri(-1, 2), a[1] + ri(-1, 2), zw, zh);
+      carveCorridorInRoom(r, main, z, chance(0.25) ? 2 : 3);
+    }
+
+    if ((r.type === 'combat' || r.type === 'treasure') && chance(0.45)) {
+      const z = addZone(r, 'hidden_alcove', b.x1 - 8, b.y0 + 2, 6, 5);
+      for (let x = z.x - 1; x <= z.x + z.w; x++) {
+        if (x > b.x0 && x < b.x1 && z.y + z.h < b.y1) breakCell(x, z.y + z.h, r.id, 5 + floor, false);
+      }
+    }
+
+    r.center = { x: main.cx, y: main.cy };
+    r.entryByDir = entryByDir;
+  }
+
+  for (const r of nodes) {
+    const x0 = ROOM_MARGIN + (r.gx - minGX) * ROOM_W;
+    const y0 = ROOM_MARGIN + (r.gy - minGY) * ROOM_H;
+    const x1 = x0 + ROOM_W - 1;
+    const y1 = y0 + ROOM_H - 1;
+    r.bounds = { x0, y0, x1, y1 };
+    r.center = { x:(x0+x1)/2, y:(y0+y1)/2 };
+    r.theme = r.type === 'merchant' ? 'shop' : r.type === 'treasure' ? 'reliquary' : r.type === 'boss' ? 'ballroom' : pick(['library','dining','gallery','storage','study','armory']);
+    r.rugs = [];
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) wallCell(x, y, r.id);
+    planRoom(r);
+    for (const z of r.zones) {
+      if (['main','arena','side'].includes(z.type) && chance(0.45)) r.rugs.push({ x:z.x+1, y:z.y+1, w:Math.max(2,z.w-2), h:Math.max(2,z.h-2), color:pick(['#8b2139','#27405e','#5d3b76','#744322']) });
+    }
+  }
+
+  function makeDoor(a, b, dir, secret = false) {
+    const ra = nodes[a], rb = nodes[b];
+    const ba = ra.bounds, bb = rb.bounds;
+    const tiles = [];
+    function addDoorTile(x, y, id) {
+      grid[y][x] = T.DOOR;
+      roomId[y][x] = id;
+      tiles.push([x, y]);
+    }
+    function addSecretTile(x, y, id, pairX, pairY) {
+      breakCell(x, y, id, 9, true, [pairX, pairY]);
+      tiles.push([x, y]);
+    }
+    if (dir === 'E' || dir === 'W') {
+      const ya = Math.floor((ba.y0 + ba.y1) / 2);
+      const xa = dir === 'E' ? ba.x1 : ba.x0;
+      const xb = dir === 'E' ? bb.x0 : bb.x1;
+      for (let off = -1; off <= 1; off++) {
+        if (secret) { addSecretTile(xa, ya+off, a, xb, ya+off); addSecretTile(xb, ya+off, b, xa, ya+off); }
+        else { addDoorTile(xa, ya+off, a); addDoorTile(xb, ya+off, b); }
+      }
+    } else {
+      const xa = Math.floor((ba.x0 + ba.x1) / 2);
+      const ya = dir === 'S' ? ba.y1 : ba.y0;
+      const yb = dir === 'S' ? bb.y0 : bb.y1;
+      for (let off = -1; off <= 1; off++) {
+        if (secret) { addSecretTile(xa+off, ya, a, xa+off, yb); addSecretTile(xa+off, yb, b, xa+off, ya); }
+        else { addDoorTile(xa+off, ya, a); addDoorTile(xa+off, yb, b); }
+      }
+    }
+    if (!secret) {
+      const door = { rooms:[a,b], dir, tiles };
+      doors.push(door);
+      for (const [x, y] of tiles) doorMap[keyOf(x, y)] = door;
+    }
+  }
+  for (const l of links) makeDoor(l.a, l.b, l.dir, l.secret);
+
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    if (grid[y][x] !== T.WALL) continue;
+    const id = roomId[y][x];
+    if (id < 0 || nodes[id].type === 'secret') continue;
+    const nearFloor = [grid[y][x+1],grid[y][x-1],grid[y+1][x],grid[y-1][x]].some(t => t === T.FLOOR || t === T.SHOP);
+    if (nearFloor && chance(0.004 + floor * 0.001)) breakCell(x, y, id, 5 + floor, false);
+  }
+
+  return { w, h, grid, deco, roomId, breakHp, secretTiles, doorMap, doors, rooms:nodes, links, start, boss:nodes.find(r => r.type === 'boss'), minGX, minGY };
+}
+
+function startRun() {
+  G.state = 'playing';
+  G.floor = 1;
+  G.seedText = 'manor-' + Date.now().toString(36) + '-' + Math.floor(Math.random()*9999);
+  G.player = makePlayer(0, 0);
+  buildFloor(true);
+  say('Rooms now fill the screen. Doors lock during fights. Clear rooms for a 75% upgrade chance.', 4600);
+}
+function buildFloor(newRun = false) {
+  G.level = generateLevel(G.floor, G.seedText);
+  G.bullets = []; G.ebullets = []; G.enemies = []; G.props = []; G.items = []; G.drops = []; G.particles = []; G.hazards = []; G.traps = [];
+  G.merchant = null; G.currentRoom = G.level.start.id;
+  const p0 = floorWorld([Math.round(G.level.start.center.x), Math.round(G.level.start.center.y)]);
+  G.player.x = p0.x; G.player.y = p0.y; G.player.inv = 1600;
+  populateLevel();
+  snapCameraToRoom(G.level.start.id, true);
+  if (!newRun) say('Floor ' + G.floor + ': the manor rebuilds its room plan.', 2400);
+}
+
+function populateLevel() {
+  for (const room of G.level.rooms) {
+    if (room.type === 'start') { decorateRoom(room, 10, false); continue; }
+    if (room.type === 'merchant') { makeMerchant(room); decorateRoom(room, 17, true); continue; }
+    if (room.type === 'treasure') { decorateRoom(room, 8, false); placeItem(room.center.x*TILE, room.center.y*TILE, false, 0, false, room.id); continue; }
+    if (room.type === 'secret') { decorateRoom(room, 6, false); placeItem(room.center.x*TILE, room.center.y*TILE, false, 0, true, room.id); continue; }
+    if (room.type === 'boss') {
+      decorateRoom(room, 10, false);
+      addRoomHazards(room, 8 + G.floor * 2);
+      const c = floorWorld([Math.round(room.center.x), Math.round(room.center.y)]);
+      spawnEnemy('boss', c.x, c.y, room.id);
+      continue;
+    }
+    decorateRoom(room, ri(10, 18), false);
+    addRoomHazards(room, ri(1, 3 + G.floor));
+    const n = ri(4, 6 + G.floor);
+    for (let i = 0; i < n; i++) {
+      const cell = randomCell(room, 4);
+      if (!cell) continue;
+      const p = floorWorld(cell);
+      spawnEnemy(pick(['skitter','spitter','slug','moth','turret']), p.x, p.y, room.id);
+    }
+  }
+}
+
+function randomCell(room, margin = 2) {
+  const zones = (room.zones || []).filter(z => !['entry','hidden_alcove'].includes(z.type));
+  for (let i = 0; i < 120; i++) {
+    let x, y;
+    if (zones.length && chance(0.82)) {
+      const z = pick(zones);
+      x = ri(Math.floor(z.x + margin), Math.floor(z.x + z.w - margin - 1));
+      y = ri(Math.floor(z.y + margin), Math.floor(z.y + z.h - margin - 1));
+    } else {
+      x = ri(room.bounds.x0 + margin, room.bounds.x1 - margin);
+      y = ri(room.bounds.y0 + margin, room.bounds.y1 - margin);
+    }
+    if (!isFloorish(x, y) || tileAt(x, y) === T.DOOR) continue;
+    const p = floorWorld([x, y]);
+    if (dist(p.x, p.y, room.center.x*TILE, room.center.y*TILE) < 72 && room.type === 'combat') continue;
+    if (solidWorld(p.x, p.y, 13)) continue;
+    return [x, y];
+  }
+  return [Math.round(room.center.x), Math.round(room.center.y)];
+}
+function decorateRoom(room, count, shopLike) {
+  const byTheme = {
+    library:['bookshelf','bookshelf','chair','table','cabinet'],
+    dining:['longtable','chair','chair','barrel','cabinet'],
+    gallery:['statue','table','chair','cabinet','crate'],
+    storage:['crate','crate','barrel','cabinet','bookshelf'],
+    study:['desk','chair','bookshelf','cabinet','table'],
+    armory:['crate','statue','cabinet','barrel','table'],
+    shop:['bookshelf','counter','chair','cabinet','crate'],
+    reliquary:['statue','cabinet','table','bookshelf'],
+    ballroom:['statue','chair','table','cabinet']
+  };
+  const types = shopLike ? byTheme.shop : (byTheme[room.theme] || byTheme.study);
+  for (let i = 0; i < count; i++) {
+    const cell = randomCell(room, 2); if (!cell) continue;
+    const p = floorWorld(cell);
+    if (dist(p.x, p.y, room.center.x*TILE, room.center.y*TILE) < 96) continue;
+    G.props.push(makeProp(p.x + ri(-5,5), p.y + ri(-5,5), pick(types), room.id));
+  }
+}
+function makeProp(x, y, type, roomId) {
+  const sizes = {
+    table:[42,26,7], longtable:[86,28,13], chair:[24,24,4], bookshelf:[30,58,10], crate:[30,30,5],
+    barrel:[28,34,6], cabinet:[34,46,8], desk:[54,30,9], counter:[70,28,12], statue:[30,30,12]
+  };
+  const s = sizes[type] || [28,28,5];
+  const solid = chance(0.82);
+  return { x, y, w:s[0], h:s[1], hp:s[2], maxHp:s[2], type, roomId, solid };
+}
+function addRoomHazards(room, count) {
+  for (let i = 0; i < count; i++) {
+    const cell = randomCell(room, 3); if (!cell) continue;
+    if (chance(0.62)) {
+      G.level.grid[cell[1]][cell[0]] = T.SPIKE;
+    } else {
+      const p = floorWorld(cell);
+      G.traps.push({ x:p.x, y:p.y, dir:pick([[1,0],[-1,0],[0,1],[0,-1]]), cd:ri(700,2400), roomId:room.id, awake:false });
+    }
+  }
+}
+function makeMerchant(room) {
+  const c = floorWorld([Math.round(room.center.x), Math.round(room.center.y)]);
+  G.merchant = { x:c.x, y:c.y-44, roomId:room.id, talk:0 };
+  for (let i = -1; i <= 1; i++) {
+    placeItem(c.x + i * 86, c.y + 48, true, Math.max(3, Math.floor((6 + G.floor*2 + ri(0,5)) * G.player.discount)), false, room.id);
+  }
+}
+function placeItem(x, y, shop = false, price = 0, hidden = false, roomId = -1) {
+  const item = pick(ITEMS);
+  G.items.push({ x, y, r:17, item, shop, price, hidden, seen:!hidden, bob:rnd()*TAU, sold:false, roomId });
+}
+function spawnEnemy(type, x, y, roomId) {
+  const hpBase = 7 + G.floor * 2.5;
+  const e = { type, x, y, vx:0, vy:0, r:13, hp:hpBase, maxHp:hpBase, damage:1, speed:80, roomId, awake:false, cd:ri(500,1800), poison:0, splitDone:false, boss:false, phase:0 };
+  if (type === 'skitter') { e.speed = 105 + G.floor*6; e.hp = hpBase * 0.9; e.r = 12; }
+  if (type === 'spitter') { e.speed = 58; e.hp = hpBase * 1.05; e.r = 13; }
+  if (type === 'slug') { e.speed = 45; e.hp = hpBase * 1.3; e.r = 15; }
+  if (type === 'moth') { e.speed = 92; e.hp = hpBase * 0.82; e.r = 11; e.phase = rnd()*TAU; }
+  if (type === 'turret') { e.speed = 0; e.hp = hpBase * 0.85; e.r = 14; }
+  if (type === 'boss') { e.boss = true; e.r = 32; e.hp = 88 + G.floor*40; e.maxHp = e.hp; e.speed = 74 + G.floor*4; e.damage = 1; }
+  e.hp = e.maxHp = Math.round(e.hp);
+  G.enemies.push(e);
+}
+
+function say(text, ms = 1800) { G.message = text; G.messageT = ms; }
+function floatText(x, y, text, color = '#fff4c8') { G.texts.push({ x, y, text, color, life: 900, vy:-24 }); }
+function burst(x, y, color, n = 10, power = 160) {
+  for (let i = 0; i < n; i++) {
+    const a = rnd()*TAU, s = rnd()*power;
+    G.particles.push({ x, y, vx:Math.cos(a)*s, vy:Math.sin(a)*s, life:ri(240,720), color, r:ri(2,5) });
+  }
+}
+
+function pickupItem(it) {
+  if (it.sold) return;
+  if (it.shop) {
+    if (G.player.coins < it.price) { say('The merchant taps the price tag. Need ' + it.price + ' coins.', 1300); return; }
+    G.player.coins -= it.price;
+  }
+  it.sold = true;
+  it.item.apply(G.player);
+  G.player.items.push(it.item.name);
+  floatText(it.x, it.y - 34, it.item.name, '#ffe78b');
+  say(it.item.name + ': ' + it.item.desc, 3300);
+  burst(it.x, it.y, '#ffe78b', 28, 210);
+  applySynergyMessages();
+}
+function applySynergyMessages() {
+  const p = G.player;
+  if (p.split && p.poison && !p._toxicFork) { p._toxicFork=true; say('Synergy: toxic forked shots seed poison puddles everywhere.', 2600); }
+  if (p.shots >= 3 && p.lightning && !p._storm) { p._storm=true; say('Synergy: wide volleys turn Static Jam into a room-wide storm.', 2600); }
+  if (p.bounce && p.homing && !p._smartBounce) { p._smartBounce=true; say('Synergy: homing rebounds hunt enemies around corners.', 2600); }
+  if (p.coinPower && p.discount < 0.8 && !p._greed) { p._greed=true; say('Synergy: cheap shops feed Cardboard Crown damage.', 2600); }
+}
+
+function spawnDrop(x, y, kind, amount = 1) {
+  G.drops.push({ x, y, kind, amount, r: kind === 'coin' ? 8 : 10, vx:ri(-60,60), vy:ri(-60,60), life: 22000 });
+}
+function damagePlayer(n, x, y) {
+  const p = G.player;
+  if (p.inv > 0 || G.state !== 'playing') return;
+  p.hp -= n;
+  p.inv = 900;
+  G.shake = 16;
+  burst(p.x, p.y, '#ff4e6d', 22, 220);
+  floatText(p.x, p.y-26, '-' + n, '#ff8a9f');
+  const ang = Math.atan2(p.y - y, p.x - x);
+  moveCircle(p, Math.cos(ang)*26, Math.sin(ang)*26, p.r);
+  if (p.hp <= 0) { G.state = 'dead'; say('The manor swallows you. Press R to start a new run.', 999999); }
+}
+
+function spawnBullet(owner, x, y, ang, opts = {}) {
+  const speed = opts.speed || (owner === 'player' ? G.player.shotSpeed : 260);
+  const b = {
+    owner, x, y, vx:Math.cos(ang)*speed, vy:Math.sin(ang)*speed, r: opts.r || (owner === 'player' ? 5 : 6),
+    damage: opts.damage || 1, life: opts.life || 1300, pierce: opts.pierce || 0, bounce: opts.bounce || 0,
+    poison: !!opts.poison, lightning: !!opts.lightning, split: !!opts.split, homing: !!opts.homing, splitDepth: opts.splitDepth || 0,
+    bomb: opts.bomb || 0, color: opts.color || (owner === 'player' ? '#f7e7b0' : '#ff7392')
+  };
+  (owner === 'player' ? G.bullets : G.ebullets).push(b);
+}
+function firePlayer() {
+  const p = G.player;
+  let ax = 0, ay = 0;
+  if (keys.arrowleft) ax -= 1; if (keys.arrowright) ax += 1; if (keys.arrowup) ay -= 1; if (keys.arrowdown) ay += 1;
+  if (ax === 0 && ay === 0 && mouse.down) {
+    const wx = mouse.x + G.cam.x, wy = mouse.y + G.cam.y;
+    ax = wx - p.x; ay = wy - p.y;
+  }
+  if (ax === 0 && ay === 0) return;
+  if (G.now < p.fireCd) return;
+  p.fireCd = G.now + p.fireRate;
+  const base = Math.atan2(ay, ax);
+  const shots = Math.max(1, p.shots);
+  const coinBonus = p.coinPower ? Math.floor(p.coins / 10) * 0.35 : 0;
+  for (let i = 0; i < shots; i++) {
+    const off = (i - (shots - 1) / 2) * p.spread + (rnd()-0.5)*0.025;
+    const crit = chance(p.crit + p.luck * 0.08);
+    spawnBullet('player', p.x + Math.cos(base)*18, p.y + Math.sin(base)*18, base + off, {
+      damage: (p.damage + coinBonus) * (crit ? 2.1 : 1), life: p.range / p.shotSpeed * 1000,
+      pierce:p.pierce, bounce:p.bounce, poison:p.poison, lightning:p.lightning, split:p.split, homing:p.homing,
+      bomb:p.bombShot, color:crit ? '#fff06b' : '#f7e7b0'
+    });
+  }
+  burst(p.x + Math.cos(base)*18, p.y + Math.sin(base)*18, '#fff4c8', 3, 50);
+}
+
+function update(dt) {
+  if (G.state === 'title') return;
+  G.now += dt;
+  const p = G.player;
+  if (G.state !== 'playing') { updateParticles(dt); return; }
+
+  let mx = 0, my = 0;
+  if (keys.a) mx -= 1; if (keys.d) mx += 1; if (keys.w) my -= 1; if (keys.s) my += 1;
+  const ml = Math.hypot(mx, my) || 1;
+  mx /= ml; my /= ml;
+  const sp = p.speed * (keys.shift ? 0.7 : 1);
+  moveCircle(p, mx * sp * dt/1000, my * sp * dt/1000, p.r);
+  if (p.inv > 0) p.inv -= dt;
+  if (p.activeCd > 0) p.activeCd -= dt;
+
+  if (keys[' '] && p.activeCd <= 0) {
+    p.activeCd = 2400;
+    burst(p.x, p.y, '#9fe9ff', 40, 280);
+    for (const e of G.enemies) if (e.awake && dist(p.x,p.y,e.x,e.y) < 150) damageEnemy(e, 4 + p.damage, p.x, p.y);
+    say('Pocket shockwave!', 800);
+  }
+
+  firePlayer();
+  updateRoomState();
+  updateBullets(dt);
+  updateEnemies(dt);
+  updateDrops(dt);
+  updateProps(dt);
+  updateHazards(dt);
+  updateParticles(dt);
+  updateItems(dt);
+  updateTraps(dt);
+  updateInteractions();
+
+  const [tx, ty] = worldTile(p.x, p.y);
+  const tile = tileAt(tx, ty);
+  if (tile === T.SPIKE && p.inv <= 0) damagePlayer(p.spikeResist ? 0.5 : 1, p.x, p.y);
+  if (tile === T.TRAPDOOR && justInteract) {
+    if (G.floor >= 4) { G.state = 'win'; say('You escaped Clockwork Manor. Press R for a new run.', 999999); }
+    else { G.floor++; buildFloor(false); }
+  }
+  if (G.messageT > 0) G.messageT -= dt;
+  justInteract = false;
+
+  const room = G.level.rooms[G.currentRoom];
+  const targetX = room ? room.center.x * TILE - innerWidth / 2 : p.x - innerWidth / 2;
+  const targetY = room ? room.center.y * TILE - innerHeight / 2 : p.y - innerHeight / 2;
+  G.cam.x = lerp(G.cam.x, targetX, 0.14);
+  G.cam.y = lerp(G.cam.y, targetY, 0.14);
+  G.shake = Math.max(0, G.shake - dt * 0.04);
+}
+
+function snapCameraToRoom(id, instant = false) {
+  const room = G.level.rooms[id];
+  if (!room) return;
+  const tx = room.center.x * TILE - innerWidth / 2;
+  const ty = room.center.y * TILE - innerHeight / 2;
+  if (instant) { G.cam.x = tx; G.cam.y = ty; }
+}
+function updateRoomState() {
+  const rid = roomAtWorld(G.player.x, G.player.y);
+  if (rid >= 0 && G.level.rooms[rid]) {
+    const room = G.level.rooms[rid];
+    if (G.currentRoom !== rid) {
+      G.currentRoom = rid;
+      snapCameraToRoom(rid, false);
+    }
+    if (!room.seen) {
+      room.seen = true;
+      if (room.type === 'combat') say('Doors lock. Clear the room for a reward.', 1300);
+      if (room.type === 'boss') say('Guardian of Floor ' + G.floor, 1500);
+      if (room.type === 'secret') say('Secret room discovered.', 1700);
+      if (room.type === 'merchant') say('Merchant: E near an item to buy. Prices respect discounts.', 1900);
+    }
+    for (const e of G.enemies) if (e.roomId === rid) e.awake = true;
+    for (const tr of G.traps) if (tr.roomId === rid) tr.awake = true;
+    for (const it of G.items) if (it.hidden && it.roomId === rid) it.seen = true;
+  }
+  for (const room of G.level.rooms) {
+    if (!room.seen || room.cleared || !['combat','boss'].includes(room.type)) continue;
+    const alive = G.enemies.some(e => e.roomId === room.id && e.hp > 0);
+    if (!alive) {
+      room.cleared = true;
+      G.shake = Math.max(G.shake, 5);
+      if (room.type === 'boss') {
+        const c = floorWorld([Math.round(room.center.x), Math.round(room.center.y)]);
+        const [tx, ty] = worldTile(c.x, c.y);
+        G.level.grid[ty][tx] = T.TRAPDOOR;
+        say('The guardian falls. Trapdoor open: stand on it and press E.', 2600);
+        burst(c.x, c.y, '#9b5cff', 54, 280);
+        for (let i = 0; i < 10 + G.floor; i++) spawnDrop(c.x + ri(-44,44), c.y + ri(-32,32), 'coin');
+        placeItem(c.x + 66, c.y, false, 0, false, room.id);
+      } else if (!room.rewarded) {
+        room.rewarded = true;
+        const c = floorWorld([Math.round(room.center.x), Math.round(room.center.y)]);
+        const upgradeChance = clamp(0.75 + G.player.luck * 0.35, 0.75, 0.94);
+        if (chance(upgradeChance)) {
+          placeItem(c.x, c.y, false, 0, false, room.id);
+          for (let i = 0; i < ri(1, 3); i++) spawnDrop(c.x+ri(-44,44), c.y+ri(-34,34), 'coin');
+          say('Room clear: upgrade reward!', 1300);
+        } else {
+          for (let i = 0; i < ri(5, 9); i++) spawnDrop(c.x+ri(-52,52), c.y+ri(-40,40), chance(0.78) ? 'coin' : 'heart');
+          say('Room clear: supplies dropped.', 1100);
+        }
+        burst(c.x, c.y, '#ffe78b', 28, 200);
+      }
+    }
+  }
+}
+
+function updateBullets(dt) {
+  function updateList(list, playerOwned) {
+    for (let i = list.length - 1; i >= 0; i--) {
+      const b = list[i];
+      b.life -= dt;
+      if (b.homing && playerOwned) {
+        const e = nearestEnemy(b.x, b.y, 260);
+        if (e) {
+          const want = Math.atan2(e.y - b.y, e.x - b.x);
+          const have = Math.atan2(b.vy, b.vx);
+          const turn = clamp(normAng(want - have), -0.055, 0.055);
+          const sp = Math.hypot(b.vx,b.vy);
+          b.vx = Math.cos(have + turn) * sp; b.vy = Math.sin(have + turn) * sp;
+        }
+      }
+      const nx = b.x + b.vx * dt/1000, ny = b.y + b.vy * dt/1000;
+      const [tx, ty] = worldTile(nx, ny);
+      if (solidTile(tx, ty)) {
+        if (tileAt(tx, ty) === T.BREAK && playerOwned) damageTile(tx, ty, b.damage + G.player.breakBonus);
+        if (b.bounce > 0) {
+          const sx = solidWorld(nx, b.y, b.r), sy = solidWorld(b.x, ny, b.r);
+          if (sx) b.vx *= -1;
+          if (sy) b.vy *= -1;
+          b.bounce--; b.x += b.vx * 0.012; b.y += b.vy * 0.012; b.life *= 0.92;
+        } else {
+          bulletDeath(b, playerOwned); list.splice(i,1);
+        }
+        continue;
+      }
+      b.x = nx; b.y = ny;
+      if (playerOwned) {
+        let hit = false;
+        for (const prop of G.props) {
+          if (prop.hp <= 0) continue;
+          if (circleRect(b.x,b.y,b.r,prop.x-prop.w/2,prop.y-prop.h/2,prop.w,prop.h)) {
+            damageProp(prop, b.damage); hit = true; break;
+          }
+        }
+        if (hit) { bulletDeath(b, true); list.splice(i,1); continue; }
+        for (const e of G.enemies) {
+          if (e.hp <= 0 || !e.awake) continue;
+          if (dist(b.x,b.y,e.x,e.y) < b.r + e.r) {
+            damageEnemy(e, b.damage, b.x, b.y, b);
+            if (b.pierce > 0) b.pierce--; else { bulletDeath(b, true); list.splice(i,1); }
+            break;
+          }
+        }
+      } else if (dist(b.x,b.y,G.player.x,G.player.y) < b.r + G.player.r) {
+        damagePlayer(1, b.x, b.y); list.splice(i,1); continue;
+      }
+      if (b.life <= 0) { bulletDeath(b, playerOwned); list.splice(i,1); }
+    }
+  }
+  updateList(G.bullets, true);
+  updateList(G.ebullets, false);
+}
+function bulletDeath(b, playerOwned) {
+  if (!playerOwned) { burst(b.x,b.y,'#ff7392',4,50); return; }
+  burst(b.x,b.y,b.color,3,45);
+  if (b.poison) G.hazards.push({ x:b.x, y:b.y, r:34, life:1600, tick:0, damage:0.42, color:'#71f060' });
+  if (b.split && b.splitDepth < 1) {
+    const a = Math.atan2(b.vy,b.vx);
+    spawnBullet('player', b.x, b.y, a + 0.55, { damage:b.damage*0.55, life:520, pierce:0, bounce:b.bounce, poison:b.poison, lightning:b.lightning, homing:b.homing, split:false, splitDepth:b.splitDepth+1, color:'#eaff9c' });
+    spawnBullet('player', b.x, b.y, a - 0.55, { damage:b.damage*0.55, life:520, pierce:0, bounce:b.bounce, poison:b.poison, lightning:b.lightning, homing:b.homing, split:false, splitDepth:b.splitDepth+1, color:'#eaff9c' });
+  }
+  if (chance(b.bomb)) explode(b.x, b.y, 74, b.damage*1.7);
+}
+function explode(x, y, r, dmg) {
+  G.shake = Math.max(G.shake, 12);
+  burst(x, y, '#ffad4d', 40, 260);
+  for (const e of G.enemies) if (e.hp > 0 && dist(x,y,e.x,e.y) < r + e.r) damageEnemy(e, dmg, x, y);
+  for (const prop of G.props) if (prop.hp > 0 && dist(x,y,prop.x,prop.y) < r + 32) damageProp(prop, dmg);
+  const [tx, ty] = worldTile(x, y);
+  for (let yy=-2; yy<=2; yy++) for (let xx=-2; xx<=2; xx++) if (dist(0,0,xx,yy) <= 2.2 && tileAt(tx+xx,ty+yy) === T.BREAK) damageTile(tx+xx,ty+yy,dmg);
+}
+function damageTile(tx, ty, dmg) {
+  const k = keyOf(tx, ty);
+  G.level.breakHp[k] = (G.level.breakHp[k] || 4) - dmg;
+  burst(tx*TILE+16, ty*TILE+16, G.level.secretTiles[k] ? '#e6ef62' : '#9b7154', 5, 80);
+  if (G.level.breakHp[k] <= 0) {
+    G.level.grid[ty][tx] = T.FLOOR;
+    delete G.level.breakHp[k];
+    if (G.level.secretTiles[k]) {
+      const pair = G.level.secretTiles[k].pair;
+      if (pair && tileAt(pair[0], pair[1]) === T.BREAK) {
+        G.level.grid[pair[1]][pair[0]] = T.FLOOR;
+        delete G.level.breakHp[keyOf(pair[0], pair[1])];
+      }
+      say('A hidden doorway opens.', 1500);
+    }
+    burst(tx*TILE+16, ty*TILE+16, '#d5a06f', 24, 180);
+    if (G.player.secretSense || chance(0.35 + G.player.luck)) spawnDrop(tx*TILE+16, ty*TILE+16, chance(0.7)?'coin':'heart');
+  }
+}
+function nearestEnemy(x, y, rad) {
+  let best = null, bd = rad;
+  for (const e of G.enemies) if (e.hp > 0 && e.awake) {
+    const d = dist(x,y,e.x,e.y);
+    if (d < bd) { bd = d; best = e; }
+  }
+  return best;
+}
+
+function damageEnemy(e, dmg, sx, sy, b) {
+  if (e.hp <= 0) return;
+  e.hp -= dmg;
+  if (b && b.poison) e.poison = Math.max(e.poison, 1800);
+  if (b && b.lightning) chainLightning(e, dmg * 0.68);
+  const a = Math.atan2(e.y - sy, e.x - sx);
+  e.vx += Math.cos(a) * 90; e.vy += Math.sin(a) * 90;
+  burst(e.x,e.y,e.boss?'#b086ff':'#ff8ca8',4,75);
+  if (e.hp <= 0) killEnemy(e);
+}
+function chainLightning(src, dmg) {
+  let from = src, used = new Set([src]);
+  for (let i = 0; i < 2 + Math.floor(G.player.luck*3); i++) {
+    let best = null, bd = 170;
+    for (const e of G.enemies) if (e.hp > 0 && e.awake && !used.has(e)) {
+      const d = dist(from.x, from.y, e.x, e.y);
+      if (d < bd) { bd = d; best = e; }
+    }
+    if (!best) break;
+    used.add(best);
+    G.particles.push({ line:true, x:from.x, y:from.y, x2:best.x, y2:best.y, life:180, color:'#9fe9ff' });
+    best.hp -= dmg; burst(best.x,best.y,'#9fe9ff',8,140);
+    if (best.hp <= 0) killEnemy(best);
+    from = best; dmg *= 0.72;
+  }
+}
+function killEnemy(e) {
+  if (e.dead) return;
+  e.dead = true; e.hp = 0; G.player.kills++;
+  burst(e.x,e.y,e.boss?'#c6a0ff':'#ff6f91',e.boss?60:22,e.boss?280:180);
+  if (e.type === 'slug' && !e.splitDone) {
+    for (let i=0;i<2;i++) { const a=rnd()*TAU; spawnEnemy('skitter', e.x+Math.cos(a)*22, e.y+Math.sin(a)*22, e.roomId); G.enemies[G.enemies.length-1].awake = true; G.enemies[G.enemies.length-1].hp = 4 + G.floor; }
+  }
+  if (chance(0.52 + G.player.luck)) spawnDrop(e.x, e.y, 'coin');
+  if (chance(0.10 + G.player.luck*0.25)) spawnDrop(e.x, e.y, 'heart');
+  if (G.player.vampire && chance(G.player.vampire)) { G.player.hp = Math.min(G.player.maxHp, G.player.hp + 1); floatText(G.player.x,G.player.y-35,'+heart','#ff9fbb'); }
+}
+
+function updateEnemies(dt) {
+  const p = G.player;
+  for (let i = G.enemies.length - 1; i >= 0; i--) {
+    const e = G.enemies[i];
+    if (e.hp <= 0) { G.enemies.splice(i,1); continue; }
+    if (!e.awake) continue;
+    if (e.poison > 0) { e.poison -= dt; e.hp -= dt * 0.0022 * (1 + G.floor*0.2); if (chance(0.08)) burst(e.x,e.y,'#71f060',2,40); if (e.hp <= 0) { killEnemy(e); continue; } }
+    const dx = p.x - e.x, dy = p.y - e.y, d = Math.hypot(dx,dy) || 1;
+    const ax = dx/d, ay = dy/d;
+    e.cd -= dt;
+    if (e.type === 'skitter') {
+      e.vx += ax * e.speed * dt/420; e.vy += ay * e.speed * dt/420;
+    } else if (e.type === 'slug') {
+      e.vx += ax * e.speed * dt/720; e.vy += ay * e.speed * dt/720;
+      if (e.cd <= 0) { e.cd = ri(1200,2200); G.hazards.push({ x:e.x, y:e.y, r:36, life:2000, tick:0, damage:0.35, color:'#a46948', hurtsPlayer:true }); }
+    } else if (e.type === 'moth') {
+      e.phase += dt/350;
+      e.vx += (ax * e.speed + Math.cos(e.phase)*90) * dt/580;
+      e.vy += (ay * e.speed + Math.sin(e.phase)*90) * dt/580;
+    } else if (e.type === 'spitter') {
+      const desired = d < 210 ? -1 : 0.65;
+      e.vx += ax * e.speed * desired * dt/580; e.vy += ay * e.speed * desired * dt/580;
+      if (e.cd <= 0 && d < 620) { e.cd = ri(850,1450); shootAt(e.x,e.y,p.x,p.y,230 + G.floor*14, '#ff7392'); }
+    } else if (e.type === 'turret') {
+      e.vx *= 0.9; e.vy *= 0.9;
+      if (e.cd <= 0 && d < 690) {
+        e.cd = ri(1000,1600);
+        for (let k=0;k<4;k++) spawnBullet('enemy', e.x, e.y, Math.atan2(dy,dx)+(k-1.5)*0.18, { speed:240, life:1800, color:'#ff7392' });
+      }
+    } else if (e.type === 'boss') {
+      e.phase += dt/1000;
+      e.vx += ax * e.speed * dt/740; e.vy += ay * e.speed * dt/740;
+      if (e.cd <= 0) {
+        e.cd = e.hp < e.maxHp*0.45 ? 680 : 1020;
+        if (chance(0.45)) {
+          for (let k=0;k<12;k++) spawnBullet('enemy', e.x, e.y, k/12*TAU + e.phase, { speed:205 + G.floor*16, life:2100, color:'#c792ff' });
+        } else {
+          shootAt(e.x,e.y,p.x,p.y,305 + G.floor*18, '#ff7392');
+          shootAt(e.x,e.y,p.x+ri(-90,90),p.y+ri(-90,90),305, '#ff7392');
+        }
+        if (chance(0.28)) {
+          const cell = randomCell(G.level.rooms[e.roomId], 3); if (cell) { const q=floorWorld(cell); spawnEnemy(pick(['skitter','moth']), q.x, q.y, e.roomId); G.enemies[G.enemies.length-1].awake = true; }
+        }
+      }
+    }
+    e.vx *= 0.88; e.vy *= 0.88;
+    moveCircle(e, e.vx * dt/1000, e.vy * dt/1000, e.r);
+    if (d < e.r + p.r && p.inv <= 0) damagePlayer(e.boss ? 1.5 : 1, e.x, e.y);
+  }
+  updateOrbitals(dt);
+}
+function shootAt(x,y,tx,ty,speed,color) { spawnBullet('enemy', x, y, Math.atan2(ty-y, tx-x), { speed, life:2200, color }); }
+function updateOrbitals(dt) {
+  const p = G.player;
+  if (!p.orbitals) return;
+  for (let i = 0; i < p.orbitals; i++) {
+    const a = G.now/430 + i * TAU / p.orbitals;
+    const ox = p.x + Math.cos(a) * 48, oy = p.y + Math.sin(a) * 48;
+    for (const e of G.enemies) if (e.hp > 0 && e.awake && dist(ox,oy,e.x,e.y) < e.r + 14) damageEnemy(e, p.damage*0.08*dt/16, p.x, p.y);
+    for (const prop of G.props) if (prop.hp > 0 && dist(ox,oy,prop.x,prop.y) < 36) damageProp(prop, 0.06*dt/16);
+  }
+}
+
+function updateDrops(dt) {
+  const p = G.player;
+  for (let i = G.drops.length - 1; i >= 0; i--) {
+    const d = G.drops[i];
+    d.life -= dt;
+    d.x += d.vx * dt/1000; d.y += d.vy * dt/1000; d.vx *= 0.94; d.vy *= 0.94;
+    const dd = dist(d.x,d.y,p.x,p.y);
+    const pull = d.kind === 'heart' ? 90 + p.magnet*70 : 120 + p.magnet*110;
+    if (dd < pull) { d.vx += (p.x-d.x)/Math.max(1,dd)*720*dt/1000; d.vy += (p.y-d.y)/Math.max(1,dd)*720*dt/1000; }
+    if (dd < d.r + p.r) {
+      if (d.kind === 'coin') { p.coins += d.amount; floatText(d.x,d.y,'+'+d.amount,'#ffd461'); }
+      if (d.kind === 'heart' && p.hp < p.maxHp) { p.hp = Math.min(p.maxHp,p.hp+1); floatText(d.x,d.y,'+heart','#ff9fbb'); }
+      G.drops.splice(i,1); continue;
+    }
+    if (d.life <= 0) G.drops.splice(i,1);
+  }
+}
+function updateProps(dt) { for (let i = G.props.length - 1; i >= 0; i--) if (G.props[i].hp <= 0) G.props.splice(i,1); }
+function damageProp(prop, dmg) {
+  prop.hp -= dmg;
+  burst(prop.x, prop.y, '#b48a62', 3, 80);
+  if (prop.hp <= 0) {
+    burst(prop.x, prop.y, '#d0a474', 18, 180);
+    if (chance(0.45 + G.player.luck*0.7)) spawnDrop(prop.x, prop.y, 'coin');
+    if (chance(0.10 + G.player.luck*0.18)) spawnDrop(prop.x+ri(-10,10), prop.y+ri(-10,10), 'heart');
+    if (chance(0.045 + G.player.luck*0.08)) placeItem(prop.x, prop.y, false, 0, false, prop.roomId);
+  }
+}
+function updateHazards(dt) {
+  for (let i = G.hazards.length - 1; i >= 0; i--) {
+    const h = G.hazards[i]; h.life -= dt; h.tick -= dt;
+    if (h.tick <= 0) {
+      h.tick = 180;
+      for (const e of G.enemies) if (e.hp > 0 && e.awake && dist(h.x,h.y,e.x,e.y) < h.r+e.r) damageEnemy(e, h.damage, h.x, h.y);
+      if (h.hurtsPlayer && dist(h.x,h.y,G.player.x,G.player.y) < h.r+G.player.r) damagePlayer(0.5, h.x, h.y);
+    }
+    if (h.life <= 0) G.hazards.splice(i,1);
+  }
+}
+function updateTraps(dt) {
+  for (const tr of G.traps) {
+    if (!tr.awake) continue;
+    tr.cd -= dt;
+    if (tr.cd <= 0) {
+      tr.cd = ri(1200, 2600);
+      spawnBullet('enemy', tr.x, tr.y, Math.atan2(tr.dir[1], tr.dir[0]), { speed:330, life:1700, color:'#ffb45d', r:4 });
+      burst(tr.x, tr.y, '#ffb45d', 6, 80);
+    }
+  }
+}
+function updateItems(dt) {
+  for (const it of G.items) {
+    it.bob += dt/500;
+    if (it.hidden && G.player.secretSense && dist(it.x,it.y,G.player.x,G.player.y) < 280) it.seen = true;
+    if (it.sold || !it.seen) continue;
+    if (dist(it.x,it.y,G.player.x,G.player.y) < 33) {
+      if (it.shop) { if (justInteract) pickupItem(it); else say('Press E to buy ' + it.item.name + ' for ' + it.price + ' coins.', 200); }
+      else pickupItem(it);
+    }
+  }
+}
+function updateInteractions() {
+  if (G.merchant && dist(G.merchant.x,G.merchant.y,G.player.x,G.player.y) < 86) {
+    G.merchant.talk = 900;
+    if (justInteract) say('Merchant: Clear rooms for upgrades, break furniture for money, and inspect cracked walls.', 2100);
+  }
+}
+function updateParticles(dt) {
+  for (let i=G.particles.length-1;i>=0;i--) {
+    const p = G.particles[i]; p.life -= dt;
+    if (!p.line) { p.x += (p.vx||0)*dt/1000; p.y += (p.vy||0)*dt/1000; p.vx*=0.92; p.vy*=0.92; }
+    if (p.life <= 0) G.particles.splice(i,1);
+  }
+  for (let i=G.texts.length-1;i>=0;i--) {
+    const t = G.texts[i]; t.life -= dt; t.y += t.vy*dt/1000;
+    if (t.life <= 0) G.texts.splice(i,1);
+  }
+}
+
+function render() {
+  const W = innerWidth, H = innerHeight;
+  ctx.clearRect(0,0,W,H);
+  if (G.state === 'title') { drawTitle(W,H); return; }
+  const sx = (Math.random()-0.5)*G.shake, sy = (Math.random()-0.5)*G.shake;
+  ctx.save(); ctx.translate(-Math.floor(G.cam.x) + sx, -Math.floor(G.cam.y) + sy);
+  drawMap(W,H);
+  drawDoors(); drawHazards(); drawDrops(); drawItems(); drawProps(); drawTraps(); drawMerchant(); drawEnemies(); drawBullets(); drawPlayer(); drawParticlesWorld();
+  ctx.restore();
+  drawLighting(W,H);
+  drawUI(W,H);
+}
+function tilePalette(t, room, d) {
+  if (!room) return '#1f1820';
+  if (t === T.SHOP) return d % 2 ? '#ede0bf' : '#e5d3ab';
+  if (room.type === 'treasure' || room.type === 'secret') return d % 2 ? '#eee4ca' : '#e2d5b9';
+  if (room.type === 'boss') return d % 2 ? '#d6c0a3' : '#cdb696';
+  return d % 2 ? '#e8dcc4' : '#ded0b5';
+}
+function drawMap(W,H) {
+  const x0 = clamp(Math.floor(G.cam.x/TILE)-2,0,G.level.w-1), y0 = clamp(Math.floor(G.cam.y/TILE)-2,0,G.level.h-1);
+  const x1 = clamp(Math.ceil((G.cam.x+W)/TILE)+2,0,G.level.w-1), y1 = clamp(Math.ceil((G.cam.y+H)/TILE)+2,0,G.level.h-1);
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const t = G.level.grid[y][x], px = x*TILE, py = y*TILE;
+    const rid = G.level.roomId[y][x];
+    const room = G.level.rooms[rid];
+    if (t === T.WALL) {
+      ctx.fillStyle = '#09080a'; ctx.fillRect(px,py,TILE,TILE);
+      ctx.fillStyle = '#161014'; ctx.fillRect(px+3,py+3,TILE-6,TILE-6);
+      if (isFloorish(x,y+1)) { ctx.fillStyle = '#000000'; ctx.fillRect(px,py+23,TILE,9); }
+    } else if (t === T.BREAK) {
+      const secret = G.level.secretTiles[keyOf(x, y)];
+      ctx.fillStyle = secret && G.player.secretSense ? '#cbdc52' : '#5d4634';
+      ctx.fillRect(px,py,TILE,TILE);
+      ctx.strokeStyle = secret && G.player.secretSense ? '#ffff95' : '#2b1f18'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(px+6,py+8); ctx.lineTo(px+18,py+18); ctx.lineTo(px+13,py+28); ctx.moveTo(px+22,py+5); ctx.lineTo(px+25,py+22); ctx.stroke();
+    } else {
+      const d = G.level.deco[y][x];
+      ctx.fillStyle = tilePalette(t, room, d);
+      ctx.fillRect(px,py,TILE,TILE);
+      ctx.fillStyle = 'rgba(72,47,33,0.08)';
+      if (d === 0) ctx.fillRect(px+4,py+4,6,6);
+      if (d === 1) ctx.fillRect(px+21,py+18,5,8);
+      if (d === 2) { ctx.strokeStyle='rgba(0,0,0,0.08)'; ctx.beginPath(); ctx.moveTo(px,py+TILE-1); ctx.lineTo(px+TILE,py+TILE-1); ctx.stroke(); }
+      if (room && room.rugs) for (const rug of room.rugs) if (x >= rug.x && x < rug.x + rug.w && y >= rug.y && y < rug.y + rug.h) {
+        ctx.fillStyle = rug.color; ctx.globalAlpha = 0.70; ctx.fillRect(px+2,py+2,TILE-4,TILE-4); ctx.globalAlpha = 1;
+        ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(px+6,py+6,TILE-12,3);
+      }
+      if (t === T.SPIKE) drawSpike(px,py);
+      if (t === T.TRAPDOOR) drawTrapdoor(px,py);
+      if (t === T.DOOR) {
+        ctx.fillStyle = '#0bf0bd'; ctx.fillRect(px,py,TILE,TILE);
+      }
+    }
+  }
+}
+function drawDoors() {
+  for (const door of G.level.doors) {
+    const closed = door.tiles.some(([x,y]) => doorClosed(x,y));
+    for (const [x,y] of door.tiles) {
+      const px=x*TILE, py=y*TILE;
+      ctx.fillStyle = closed ? '#5a1b2c' : '#0bf0bd';
+      ctx.fillRect(px+2,py+2,TILE-4,TILE-4);
+      ctx.strokeStyle = closed ? '#ff5f87' : '#bffff2'; ctx.lineWidth = 2; ctx.strokeRect(px+4,py+4,TILE-8,TILE-8);
+    }
+  }
+}
+function drawSpike(px,py) {
+  ctx.fillStyle = '#755d67';
+  for (let i=0;i<3;i++) { ctx.beginPath(); ctx.moveTo(px+6+i*9,py+24); ctx.lineTo(px+11+i*9,py+8); ctx.lineTo(px+16+i*9,py+24); ctx.fill(); }
+}
+function drawTrapdoor(px,py) {
+  ctx.fillStyle = '#110b13'; ctx.fillRect(px+4,py+4,24,24);
+  ctx.strokeStyle = '#9b5cff'; ctx.lineWidth = 2; ctx.strokeRect(px+6,py+6,20,20);
+  ctx.fillStyle = '#9b5cff'; ctx.fillRect(px+15,py+7,2,18);
+}
+function drawProps() {
+  for (const p of G.props) {
+    ctx.save(); ctx.translate(p.x,p.y);
+    const hurt = p.hp / p.maxHp;
+    const colors = { table:'#704b2e', longtable:'#65442b', chair:'#7a5031', bookshelf:'#5b3a24', crate:'#80613d', barrel:'#765237', cabinet:'#674328', desk:'#6d4428', counter:'#6a442b', statue:'#77706b' };
+    ctx.fillStyle = colors[p.type] || '#775138';
+    ctx.fillRect(-p.w/2,-p.h/2,p.w,p.h);
+    ctx.fillStyle = 'rgba(255,255,255,0.14)'; ctx.fillRect(-p.w/2+3,-p.h/2+3,p.w-6,4);
+    if (!p.solid) { ctx.globalAlpha=0.25; ctx.fillStyle='#f7e7b0'; ctx.fillRect(-p.w/2,-p.h/2,p.w,p.h); ctx.globalAlpha=1; }
+    if (hurt < 0.65) { ctx.strokeStyle = '#231313'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(-p.w/3,-p.h/4); ctx.lineTo(p.w/5,p.h/4); ctx.stroke(); }
+    if (p.type === 'bookshelf' || p.type === 'cabinet') { ctx.fillStyle='#2c1d18'; for(let i=-1;i<=1;i++) ctx.fillRect(-p.w/2+5,p.h*i/5,p.w-10,3); }
+    if (p.type === 'statue') { ctx.fillStyle='#4e4946'; ctx.beginPath(); ctx.arc(0,-3,8,0,TAU); ctx.fill(); }
+    ctx.restore();
+  }
+}
+function drawItems() {
+  for (const it of G.items) {
+    if (it.sold || !it.seen) continue;
+    const y = it.y + Math.sin(it.bob)*5;
+    ctx.fillStyle = it.shop ? '#4b3a27' : '#352541'; ctx.fillRect(it.x-20,it.y+12,40,10);
+    ctx.beginPath(); ctx.arc(it.x,y,it.r,0,TAU); ctx.fillStyle = it.hidden ? '#ddea66' : '#ffe78b'; ctx.fill();
+    ctx.strokeStyle = '#fff7d0'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#392b14'; ctx.font = 'bold 13px monospace'; ctx.textAlign='center'; ctx.fillText(it.item.name[0], it.x, y+5);
+    if (it.shop) { ctx.fillStyle='#ffd461'; ctx.font='12px monospace'; ctx.fillText(it.price + 'c', it.x, it.y + 39); }
+  }
+}
+function drawDrops() {
+  for (const d of G.drops) {
+    ctx.beginPath(); ctx.arc(d.x,d.y,d.r,0,TAU);
+    ctx.fillStyle = d.kind === 'coin' ? '#ffd461' : '#ff658d'; ctx.fill();
+    ctx.strokeStyle = '#2d1c10'; ctx.stroke();
+  }
+}
+function drawHazards() {
+  for (const h of G.hazards) {
+    ctx.globalAlpha = clamp(h.life/900,0,0.55);
+    ctx.beginPath(); ctx.arc(h.x,h.y,h.r,0,TAU); ctx.fillStyle = h.color; ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+function drawTraps() {
+  for (const t of G.traps) {
+    ctx.save(); ctx.translate(t.x,t.y); ctx.rotate(Math.atan2(t.dir[1],t.dir[0]));
+    ctx.fillStyle='#51323b'; ctx.fillRect(-12,-10,24,20);
+    ctx.fillStyle='#ffb45d'; ctx.fillRect(2,-3,12,6);
+    ctx.restore();
+  }
+}
+function drawMerchant() {
+  const m = G.merchant; if (!m) return;
+  ctx.save(); ctx.translate(m.x,m.y);
+  ctx.fillStyle='#2b1e36'; ctx.beginPath(); ctx.arc(0,10,25,0,TAU); ctx.fill();
+  ctx.fillStyle='#c792ff'; ctx.beginPath(); ctx.arc(-8,0,4,0,TAU); ctx.arc(8,0,4,0,TAU); ctx.fill();
+  ctx.fillStyle='#ffd461'; ctx.fillRect(-18,24,36,6);
+  ctx.restore();
+}
+function drawEnemies() {
+  for (const e of G.enemies) {
+    if (e.hp <= 0) continue;
+    ctx.save(); ctx.translate(e.x,e.y);
+    if (!e.awake) ctx.globalAlpha = 0.45;
+    if (e.type === 'skitter') { ctx.fillStyle='#d4144a'; polygon(0,0,e.r,6,G.now/500); }
+    else if (e.type === 'spitter') { ctx.fillStyle='#d4144a'; ctx.beginPath(); ctx.arc(0,0,e.r,0,TAU); ctx.fill(); ctx.fillStyle='#5d2030'; ctx.fillRect(-9,-3,18,6); }
+    else if (e.type === 'slug') { ctx.fillStyle='#b0163f'; ctx.beginPath(); ctx.ellipse(0,0,e.r+5,e.r,0,0,TAU); ctx.fill(); }
+    else if (e.type === 'moth') { ctx.fillStyle='#e01850'; ctx.beginPath(); ctx.ellipse(-7,0,12,7,0.5,0,TAU); ctx.ellipse(7,0,12,7,-0.5,0,TAU); ctx.fill(); }
+    else if (e.type === 'turret') { ctx.fillStyle='#871230'; polygon(0,0,e.r,8,0); ctx.fillStyle='#ff7392'; ctx.fillRect(-4,-18,8,18); }
+    else if (e.type === 'boss') { ctx.fillStyle='#6d1743'; polygon(0,0,e.r,9,G.now/900); ctx.fillStyle='#ff9fbb'; ctx.beginPath(); ctx.arc(-10,-6,5,0,TAU); ctx.arc(10,-6,5,0,TAU); ctx.fill(); }
+    if (e.poison > 0) { ctx.strokeStyle='#71f060'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(0,0,e.r+4,0,TAU); ctx.stroke(); }
+    if (e.boss) { ctx.fillStyle='#1a0f21'; ctx.fillRect(-40,-48,80,7); ctx.fillStyle='#ff6f91'; ctx.fillRect(-40,-48,80*(e.hp/e.maxHp),7); }
+    ctx.restore();
+  }
+}
+function polygon(x,y,r,n,rot=0) {
+  ctx.beginPath();
+  for(let i=0;i<n;i++){const a=rot+i/n*TAU; const px=x+Math.cos(a)*r, py=y+Math.sin(a)*r; if(i)ctx.lineTo(px,py);else ctx.moveTo(px,py);}
+  ctx.closePath(); ctx.fill();
+}
+function drawBullets() {
+  for (const b of G.bullets.concat(G.ebullets)) {
+    ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,TAU); ctx.fillStyle=b.color; ctx.fill();
+    if (b.lightning) { ctx.strokeStyle='#9fe9ff'; ctx.lineWidth=1; ctx.stroke(); }
+  }
+}
+function drawPlayer() {
+  const p = G.player;
+  ctx.save(); ctx.translate(p.x,p.y);
+  if (p.inv > 0 && Math.floor(G.now/80)%2===0) ctx.globalAlpha = 0.45;
+  ctx.fillStyle='#f4e9d8'; ctx.beginPath(); ctx.arc(0,0,p.r,0,TAU); ctx.fill();
+  ctx.fillStyle='#211722'; ctx.beginPath(); ctx.arc(-4,-3,2,0,TAU); ctx.arc(5,-3,2,0,TAU); ctx.fill();
+  ctx.strokeStyle='#d6c1af'; ctx.lineWidth=3; ctx.beginPath(); ctx.arc(0,0,p.r+4,0,TAU); ctx.stroke();
+  ctx.restore();
+  if (p.orbitals) {
+    for (let i=0;i<p.orbitals;i++) {
+      const a=G.now/430+i*TAU/p.orbitals, ox=p.x+Math.cos(a)*48, oy=p.y+Math.sin(a)*48;
+      ctx.save(); ctx.translate(ox,oy); ctx.rotate(a*3); ctx.fillStyle='#c9d0d9'; polygon(0,0,12,8,0); ctx.restore();
+    }
+  }
+}
+function drawParticlesWorld() {
+  for (const p of G.particles) {
+    ctx.globalAlpha = clamp(p.life/500,0,1);
+    if (p.line) { ctx.strokeStyle=p.color; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(p.x2,p.y2); ctx.stroke(); }
+    else { ctx.fillStyle=p.color; ctx.beginPath(); ctx.arc(p.x,p.y,p.r||3,0,TAU); ctx.fill(); }
+    ctx.globalAlpha=1;
+  }
+  for (const t of G.texts) {
+    ctx.globalAlpha = clamp(t.life/450,0,1);
+    ctx.fillStyle=t.color; ctx.font='bold 15px monospace'; ctx.textAlign='center'; ctx.fillText(t.text,t.x,t.y);
+    ctx.globalAlpha=1;
+  }
+}
+function drawLighting(W,H) {
+  const p = G.player;
+  const gx = p.x - G.cam.x, gy = p.y - G.cam.y;
+  const grad = ctx.createRadialGradient(gx,gy,130+p.glow,gx,gy,620+p.glow);
+  grad.addColorStop(0,'rgba(0,0,0,0)'); grad.addColorStop(1,'rgba(0,0,0,0.38)');
+  ctx.fillStyle=grad; ctx.fillRect(0,0,W,H);
+}
+function drawUI(W,H) {
+  const p = G.player;
+  ctx.fillStyle='rgba(11,8,14,0.72)'; ctx.fillRect(14,14,400,104);
+  ctx.fillStyle='#f4e9d8'; ctx.font='bold 17px monospace'; ctx.textAlign='left';
+  ctx.fillText('Clockwork Manor - Floor ' + G.floor + '/4', 26, 38);
+  for (let i=0;i<p.maxHp;i++) {
+    ctx.fillStyle = i < Math.ceil(p.hp) ? '#ff658d' : '#3f2632';
+    ctx.beginPath(); ctx.arc(32+i*18,62,7,0,TAU); ctx.fill();
+    if (p.hp % 1 === 0.5 && i === Math.floor(p.hp)) { ctx.fillStyle='#3f2632'; ctx.fillRect(32+i*18,55,8,14); }
+  }
+  ctx.fillStyle='#ffd461'; ctx.fillText('coins ' + p.coins, 26, 91);
+  ctx.fillStyle='#b9f7ff'; ctx.fillText('items ' + p.items.length + '   kills ' + p.kills, 128, 91);
+  ctx.fillStyle='#f4e9d8'; ctx.font='12px monospace';
+  ctx.fillText('WASD move | arrows/mouse shoot | E buy/exit/talk | Space shockwave | R restart after run', 26, 111);
+
+  drawMiniMap(W,H);
+
+  if (G.messageT > 0 && G.message) {
+    const lines = wrapText(G.message, 84);
+    ctx.fillStyle='rgba(11,8,14,0.78)'; ctx.fillRect(W/2-410,H-92,820,58 + lines.length*2);
+    ctx.fillStyle='#fff0c8'; ctx.font='bold 15px monospace'; ctx.textAlign='center';
+    lines.forEach((l,i)=>ctx.fillText(l,W/2,H-60+i*19));
+  }
+  if (G.state === 'dead' || G.state === 'win') drawEndOverlay(W,H);
+}
+function drawMiniMap(W,H) {
+  const rooms = G.level.rooms;
+  const scale = 18, ox = W - 185, oy = 52;
+  ctx.fillStyle='rgba(11,8,14,0.68)'; ctx.fillRect(ox-62,oy-44,164,138);
+  for (const l of G.level.links) {
+    if (l.secret) continue;
+    const a=rooms[l.a], b=rooms[l.b]; if (!a.seen || !b.seen) continue;
+    ctx.strokeStyle='rgba(230,220,200,0.38)'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(ox+a.gx*scale,oy+a.gy*scale); ctx.lineTo(ox+b.gx*scale,oy+b.gy*scale); ctx.stroke();
+  }
+  for (const r of rooms) {
+    if (r.type === 'secret' && !r.seen && !G.player.secretSense) continue;
+    if (!r.seen && r.type !== 'secret') continue;
+    const x=ox+r.gx*scale, y=oy+r.gy*scale;
+    ctx.fillStyle = r.type==='boss'?'#9b5cff':r.type==='merchant'?'#ffd461':r.type==='treasure'?'#ffe78b':r.type==='secret'?'#ddea66':r.id===G.currentRoom?'#0bf0bd':'#75677e';
+    if (!r.seen) ctx.globalAlpha=0.35;
+    ctx.fillRect(x-6,y-5,12,10); ctx.globalAlpha=1;
+    if (r.id === G.currentRoom) { ctx.strokeStyle='#ffffff'; ctx.strokeRect(x-8,y-7,16,14); }
+  }
+}
+function drawEndOverlay(W,H) {
+  ctx.fillStyle='rgba(0,0,0,0.68)'; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle=G.state==='win'?'#ffe78b':'#ff8ca8'; ctx.font='bold 44px monospace'; ctx.textAlign='center';
+  ctx.fillText(G.state==='win'?'ESCAPED THE MANOR':'RUN ENDED', W/2, H/2-36);
+  ctx.fillStyle='#f4e9d8'; ctx.font='18px monospace';
+  ctx.fillText('Items: ' + G.player.items.join(', '), W/2, H/2+4);
+  ctx.fillText('Press R for a new procedurally generated run', W/2, H/2+38);
+}
+function drawTitle(W,H) {
+  const g=ctx.createLinearGradient(0,0,W,H); g.addColorStop(0,'#0c0910'); g.addColorStop(1,'#211417'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  ctx.fillStyle='#ffe78b'; ctx.font='bold 54px monospace'; ctx.fillText('CLOCKWORK MANOR', W/2, H/2-104);
+  ctx.fillStyle='#f4e9d8'; ctx.font='18px monospace';
+  ctx.fillText('A single-file HTML5 room-based top-down roguelite prototype', W/2, H/2-64);
+  ctx.fillStyle='#b9f7ff'; ctx.font='16px monospace';
+  ctx.fillText('Screen-sized handcrafted-feeling rooms, teal doors, yellow secrets, breakable furniture, traps, merchants, bosses, and item synergies.', W/2, H/2-26);
+  ctx.fillStyle='#f4e9d8'; ctx.fillText('WASD move · Arrow keys or mouse shoot · E interact/buy/exit · Space shockwave', W/2, H/2+18);
+  ctx.fillStyle='#ffe78b'; ctx.font='bold 22px monospace'; ctx.fillText('Click or press Enter to enter the manor', W/2, H/2+72);
+  ctx.fillStyle='rgba(255,255,255,0.18)'; ctx.font='13px monospace';
+  ctx.fillText('Original theme and item names; genre-inspired, not a copy of any existing game assets or story.', W/2, H-48);
+}
+
+let last = performance.now();
+function loop(t) {
+  const dt = Math.min(33, t - last); last = t;
+  update(dt); render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
